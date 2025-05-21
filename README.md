@@ -1,2 +1,7 @@
-### Run command
-```cargo run --bin compare -- -e https://grpc.fra.shyft.to --x-token <yellowstone_auth_token> --shredstreams https://shreds.fra.shyft.to --shred-auth-token <shredstream_auth_token> --timeout-dur 30```
+## Environment setup
+Copy contents of `.env.example` and meke `.env` file, update your values on it.
+
+```cp .env.example .env```
+
+## Run
+```cargo run --bin compare```

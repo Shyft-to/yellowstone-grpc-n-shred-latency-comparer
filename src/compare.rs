@@ -1,12 +1,13 @@
 use {
     chrono::Utc,
-    clap::{Parser, ValueEnum},
+    dotenv::dotenv,
     futures::{sink::SinkExt, stream::StreamExt},
     jito_protos::shredstream::{
         shredstream_proxy_client::ShredstreamProxyClient, SubscribeEntriesRequest,
     },
     log::{error, info},
     maplit::hashmap,
+    serde::Deserialize,
     solana_entry::entry::Entry,
     solana_sdk::signature::Signature,
     std::{
@@ -25,73 +26,50 @@ use {
     },
 };
 
-#[derive(Debug, Clone, Parser)]
-#[clap(author, version, about)]
-struct Args {
-    #[clap(short, long)]
-    #[arg(use_value_delimiter = true)]
-    /// Service endpoint
-    endpoints: Vec<String>,
-
-    #[clap(long)]
+#[derive(Debug, Deserialize, Clone)]
+struct StreamConfig {
+    uri: String,
     x_token: Option<String>,
+}
 
-    #[clap(short, long)]
-    #[arg(use_value_delimiter = true)]
-    shredstreams: Option<Vec<String>>,
-
-    #[clap(long)]
-    shred_auth_token: Option<String>,
-
-    /// Timeout in seconds (default: 60)
-    #[clap(long, default_value_t = 60)]
+#[derive(Debug, Clone)]
+struct Args {
+    yellowstone_stream_configs: Vec<StreamConfig>,
+    shred_stream_configs: Option<Vec<StreamConfig>>,
     timeout_dur: u64,
-
-    /// Commitment level: processed, confirmed or finalized
-    #[clap(long)]
-    commitment: Option<ArgsCommitment>,
-
-    /// Filter vote transactions
-    #[clap(long)]
-    vote: Option<bool>,
-
-    /// Filter failed transactions
-    #[clap(long)]
-    failed: Option<bool>,
-
-    /// Filter by transaction signature
-    #[clap(long)]
-    signature: Option<String>,
-
-    /// Filter included account in transactions
-    #[clap(long)]
-    account_include: Vec<String>,
-
-    /// Filter excluded account in transactions
-    #[clap(long)]
-    account_exclude: Vec<String>,
-
-    /// Filter required account in transactions
-    #[clap(long)]
-    account_required: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
-enum ArgsCommitment {
-    #[default]
-    Processed,
-    Confirmed,
-    Finalized,
-}
+impl Args {
+    fn from_env() -> Self {
+        dotenv().ok();
+        env::set_var(
+            env_logger::DEFAULT_FILTER_ENV,
+            env::var_os(env_logger::DEFAULT_FILTER_ENV).unwrap_or_else(|| "info".into()),
+        );
+        env_logger::init();
 
-impl From<ArgsCommitment> for CommitmentLevel {
-    fn from(commitment: ArgsCommitment) -> Self {
-        match commitment {
-            ArgsCommitment::Processed => CommitmentLevel::Processed,
-            ArgsCommitment::Confirmed => CommitmentLevel::Confirmed,
-            ArgsCommitment::Finalized => CommitmentLevel::Finalized,
+        let yellowstone_stream_configs =
+            parse_json_vec_env::<StreamConfig>("YELLOWSTONE_STREAM_CONFIGS");
+        let shred_stream_configs = parse_json_vec_env::<StreamConfig>("SHRED_STREAM_CONFIGS");
+
+        let timeout_dur = env::var("TIMEOUT_DUR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+
+        Args {
+            yellowstone_stream_configs: yellowstone_stream_configs,
+            shred_stream_configs: Some(shred_stream_configs),
+            timeout_dur,
         }
     }
+}
+
+fn parse_json_vec_env<T: for<'de> Deserialize<'de>>(key: &str) -> Vec<T> {
+    env::var(key)
+        .ok()
+        .and_then(|v| serde_json::from_str::<Vec<T>>(&v).ok())
+        .unwrap_or_default()
 }
 
 #[derive(Eq, Hash, PartialEq, Default, Debug)]
@@ -103,7 +81,6 @@ struct Timing {
 #[derive(Default, Debug)]
 struct LatencyChecker {
     txns: HashMap<String, HashSet<Timing>>,
-    //slots: HashMap<String, HashSet<Timing>>,
     blocks: HashMap<String, HashSet<Timing>>,
 }
 struct LatencyCheckerInput {
@@ -209,43 +186,41 @@ impl LatencyChecker {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    env::set_var(
-        env_logger::DEFAULT_FILTER_ENV,
-        env::var_os(env_logger::DEFAULT_FILTER_ENV).unwrap_or_else(|| "info".into()),
-    );
-    env_logger::init();
+    let args = Args::from_env();
+    info!("Args: {:?}", args);
+    let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(args.timeout_dur));
 
     let mut latency_checker = LatencyChecker::default();
 
-    let args = Args::parse();
-    let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(args.timeout_dur));
-    info!("Args: {:?}", args);
     let mut shutdown_sig = Vec::new();
     let (m_tx, m_rx) = mpsc::channel(100_000);
 
-    for endpoint in args.endpoints {
-        let token = args.x_token.clone();
+    for yellowstone_stream_config in args.yellowstone_stream_configs {
+        let token = yellowstone_stream_config.x_token.clone();
         let (tx, rx) = oneshot::channel();
         shutdown_sig.push(tx);
         let m_tx = m_tx.clone();
 
-        info!("starting {endpoint}");
+        info!(
+            "starting yellowstone grpc stream{}",
+            yellowstone_stream_config.uri
+        );
         tokio::spawn(async move {
-            grpc_message_handler(rx, endpoint, token, m_tx).await;
+            grpc_message_handler(rx, yellowstone_stream_config.uri, token, m_tx).await;
         });
     }
 
-    match args.shredstreams {
-        Some(shredstreams) => {
-            for shredstream_endpoint in shredstreams {
-                let token = args.shred_auth_token.clone();
+    match args.shred_stream_configs {
+        Some(shred_stream_configs) => {
+            for shred_stream_config in shred_stream_configs {
+                let token = shred_stream_config.x_token.clone();
                 let (tx, rx) = oneshot::channel();
                 shutdown_sig.push(tx);
                 let m_tx = m_tx.clone();
 
-                info!("starting {shredstream_endpoint}");
+                info!("starting shredstream {}", shred_stream_config.uri);
                 tokio::spawn(async move {
-                    shred_message_handler(rx, shredstream_endpoint, token, m_tx).await;
+                    shred_message_handler(rx, shred_stream_config.uri, token, m_tx).await;
                 });
             }
         }
@@ -371,7 +346,6 @@ async fn shred_message_handler(
 
     let mut request = Request::new(SubscribeEntriesRequest {});
     if let Some(token) = token {
-        // let metadata_value = MetadataValue::from_bytes(&token.into_bytes());
         let metadata_value = MetadataValue::from_str(&token).unwrap();
         request.metadata_mut().insert("x-token", metadata_value);
     }
