@@ -1,0 +1,2 @@
+### Run command
+```cargo run --bin compare -- -e https://grpc.fra.shyft.to --x-token <yellowstone_auth_token> --shredstreams https://shreds.fra.shyft.to --shred-auth-token <shredstream_auth_token> --timeout-dur 30```
